@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -m py_compile \"$CLAUDE_FILE_PATH\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python coupang_sms.py)",
+      "Bash(python -m py_compile *)",
+      "Bash(pip install *)",
+      "Bash(pip freeze *)",
+      "Bash(pyinstaller *)"
+    ],
+    "deny": []
+  }
+}

@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+
+# PyInstaller
+build/
+dist/
+*.manifest
+
+# Runtime data
+sent_orders.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
