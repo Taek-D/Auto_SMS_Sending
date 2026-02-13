@@ -1,5 +1,6 @@
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
+import csv
 import requests
 import time
 import hmac
@@ -7,24 +8,42 @@ import hashlib
 import json
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
+import pystray
+from PIL import Image, ImageDraw
 
 class CoupangAutoSMSApp:
     def __init__(self, root):
         self.root = root
         self.root.title("쿠팡 주문 자동 SMS 발송기 v2.0 (연결진단 포함)")
         self.root.geometry("850x850") # 높이를 조금 늘림
-        
+
         self.is_running = False
         self.log_lock = threading.Lock()
-        
+
+        # 설정 파일
+        self.config_file = "config.json"
+
         # 발송 기록 파일 설정
         self.history_file = "sent_orders.json"
         self.sent_orders = self.load_sent_history()
 
+        # 발송 상세 로그 (CSV 내보내기용)
+        self.send_log = []
+
+        # 트레이 아이콘
+        self.tray_icon = None
+
         # UI 구성
         self.create_widgets()
-        
+
+        # 저장된 설정 불러오기
+        self.load_config()
+
+        # X 버튼 클릭 시 트레이로 최소화
+        self.root.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
+
         self.log(f"프로그램 준비 완료. 기존 발송 기록 {len(self.sent_orders)}건 로드됨.")
 
     def create_widgets(self):
@@ -40,6 +59,12 @@ class CoupangAutoSMSApp:
 
         self.btn_reset = ttk.Button(control_frame, text="발송 기록 초기화", command=self.reset_history)
         self.btn_reset.pack(side="left", padx=5, pady=10)
+
+        self.btn_save = ttk.Button(control_frame, text="설정 저장", command=self.save_config)
+        self.btn_save.pack(side="left", padx=5, pady=10)
+
+        self.btn_export = ttk.Button(control_frame, text="로그 내보내기", command=self.export_log)
+        self.btn_export.pack(side="left", padx=5, pady=10)
 
         # [추가됨] 연결 확인 버튼
         self.btn_check = ttk.Button(control_frame, text="환경 진단 (연결 확인)", command=self.check_connection)
@@ -91,6 +116,16 @@ class CoupangAutoSMSApp:
         self.entry_sender_phone = ttk.Entry(sms_frame, width=20)
         self.entry_sender_phone.grid(row=1, column=1, sticky="w", padx=5, pady=5)
 
+        # 4-1. 조회 설정 패널
+        interval_frame = ttk.LabelFrame(self.root, text="조회 설정")
+        interval_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(interval_frame, text="조회 간격(초):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self.entry_interval = ttk.Entry(interval_frame, width=10)
+        self.entry_interval.insert(0, "60")
+        self.entry_interval.grid(row=0, column=1, sticky="w", padx=5, pady=5)
+        ttk.Label(interval_frame, text="(최소 10초)").grid(row=0, column=2, sticky="w", padx=5, pady=5)
+
         # 5. 메시지 템플릿
         msg_frame = ttk.LabelFrame(self.root, text="3) 자동 발송 메시지 템플릿")
         msg_frame.pack(fill="x", padx=10, pady=5)
@@ -106,6 +141,111 @@ class CoupangAutoSMSApp:
         
         self.log_area = scrolledtext.ScrolledText(log_frame, state='disabled', height=10)
         self.log_area.pack(fill="both", expand=True, padx=5, pady=5)
+
+    # --- [기능] 시스템 트레이 ---
+    def _create_tray_icon_image(self):
+        img = Image.new("RGB", (64, 64), (0, 120, 215))
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([16, 16, 48, 48], fill=(255, 255, 255))
+        draw.text((22, 20), "SMS", fill=(0, 120, 215))
+        return img
+
+    def minimize_to_tray(self):
+        self.root.withdraw()
+        if self.tray_icon is None:
+            menu = pystray.Menu(
+                pystray.MenuItem("열기", self.restore_from_tray, default=True),
+                pystray.MenuItem("종료", self.quit_app)
+            )
+            self.tray_icon = pystray.Icon(
+                "coupang_sms",
+                self._create_tray_icon_image(),
+                "쿠팡 SMS 발송기",
+                menu
+            )
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        else:
+            self.tray_icon.visible = True
+        self.log("트레이로 최소화되었습니다.")
+
+    def restore_from_tray(self):
+        self.root.after(0, self.root.deiconify)
+
+    def quit_app(self):
+        self.is_running = False
+        if self.tray_icon:
+            self.tray_icon.stop()
+        self.root.after(0, self.root.destroy)
+
+    # --- [기능] 설정 저장/불러오기 ---
+    def save_config(self):
+        config = {
+            "vendor_id": self.entry_vendor_id.get(),
+            "access_key": self.entry_access_key.get(),
+            "secret_key": self.entry_secret_key.get(),
+            "sms_id": self.entry_sms_id.get(),
+            "sms_pw": self.entry_sms_pw.get(),
+            "sender_phone": self.entry_sender_phone.get(),
+            "interval": self.entry_interval.get(),
+            "template": self.text_template.get("1.0", tk.END).strip()
+        }
+        try:
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+            self.log("설정이 저장되었습니다.")
+            messagebox.showinfo("완료", "설정이 저장되었습니다.")
+        except Exception as e:
+            self.log(f"설정 저장 실패: {e}")
+            messagebox.showerror("오류", f"설정 저장 실패: {e}")
+
+    def load_config(self):
+        if not os.path.exists(self.config_file):
+            return
+        try:
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            self.entry_vendor_id.insert(0, config.get("vendor_id", ""))
+            self.entry_access_key.insert(0, config.get("access_key", ""))
+            self.entry_secret_key.insert(0, config.get("secret_key", ""))
+            self.entry_sms_id.insert(0, config.get("sms_id", ""))
+            self.entry_sms_pw.insert(0, config.get("sms_pw", ""))
+            self.entry_sender_phone.insert(0, config.get("sender_phone", ""))
+            interval = config.get("interval", "60")
+            self.entry_interval.delete(0, tk.END)
+            self.entry_interval.insert(0, interval)
+            template = config.get("template", "")
+            if template:
+                self.text_template.delete("1.0", tk.END)
+                self.text_template.insert("1.0", template)
+            self.log("저장된 설정을 불러왔습니다.")
+        except Exception as e:
+            self.log(f"설정 불러오기 실패: {e}")
+
+    # --- [기능] 로그 내보내기 ---
+    def export_log(self):
+        if not self.send_log:
+            messagebox.showinfo("알림", "내보낼 발송 기록이 없습니다.")
+            return
+
+        default_name = f"발송로그_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV 파일", "*.csv")],
+            initialfile=default_name
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=["시간", "주문번호", "고객명", "수신번호", "결과"])
+                writer.writeheader()
+                writer.writerows(self.send_log)
+            self.log(f"발송 로그 내보내기 완료: {file_path} ({len(self.send_log)}건)")
+            messagebox.showinfo("완료", f"{len(self.send_log)}건의 기록을 저장했습니다.")
+        except Exception as e:
+            self.log(f"로그 내보내기 실패: {e}")
+            messagebox.showerror("오류", f"내보내기 실패: {e}")
 
     # --- [기능] 연결 확인 (Environment Check) ---
     def check_connection(self):
@@ -132,25 +272,46 @@ class CoupangAutoSMSApp:
             self.root.after(0, lambda: self.lbl_ip_status.configure(text=f"공인 IP : 확인 실패", foreground="red"))
             self.log(f"IP 확인 실패: {e}")
 
-        # 2. 쿠팡 API 연결 확인 (시뮬레이션)
-        # 실제로는 여기서 실제 쿠팡 API를 1회 호출하여 200 OK가 뜨는지 봐야 함
-        if self.entry_access_key.get() and self.entry_secret_key.get():
-            time.sleep(0.5) # 통신 시간 시뮬레이션
-            self.root.after(0, lambda: self.lbl_coupang_status.configure(text="● 쿠팡 API 상태 : 정상 응답", foreground="green"))
-            self.log("쿠팡 API 키 형식 확인 완료.")
+        # 2. 쿠팡 API 연결 확인 (실제 호출)
+        if self.entry_access_key.get() and self.entry_secret_key.get() and self.entry_vendor_id.get():
+            try:
+                orders = self.get_coupang_orders()
+                self.root.after(0, lambda: self.lbl_coupang_status.configure(
+                    text=f"● 쿠팡 API 상태 : 정상 (최근 주문 {len(orders)}건)", foreground="green"))
+                self.log("쿠팡 API 연결 확인 완료.")
+            except Exception as e:
+                self.root.after(0, lambda: self.lbl_coupang_status.configure(
+                    text="● 쿠팡 API 상태 : 연결 실패", foreground="red"))
+                self.log(f"쿠팡 API 연결 실패: {e}")
         else:
-            self.root.after(0, lambda: self.lbl_coupang_status.configure(text="● 쿠팡 API 상태 : 키 정보 누락", foreground="red"))
+            self.root.after(0, lambda: self.lbl_coupang_status.configure(
+                text="● 쿠팡 API 상태 : 키 정보 누락", foreground="red"))
             self.log("쿠팡 API 키가 입력되지 않았습니다.")
 
-        # 3. 문자 서비스 연결 확인 (시뮬레이션)
+        # 3. 마이문자 연결 확인 (잔여 건수 조회)
         if self.entry_sms_id.get() and self.entry_sms_pw.get():
-            time.sleep(0.5)
-            # 잔여 건수는 실제 API 호출 결과로 대체해야 함
-            balance = 100 # 가상의 잔여 건수
-            self.root.after(0, lambda: self.lbl_sms_status.configure(text=f"● 마이문자 상태 : 정상 (잔여: {balance}건)", foreground="green"))
-            self.log("마이문자 로그인 정보 확인 완료.")
+            try:
+                url = "https://www.mymessage.co.kr/api/getBalance"
+                payload = {
+                    "userId": self.entry_sms_id.get(),
+                    "userPw": self.entry_sms_pw.get()
+                }
+                resp = requests.post(url, data=payload, timeout=10)
+                result = resp.json()
+                if result.get("result") == "success":
+                    balance = result.get("balance", "?")
+                    self.root.after(0, lambda: self.lbl_sms_status.configure(
+                        text=f"● 마이문자 상태 : 정상 (잔여: {balance}건)", foreground="green"))
+                    self.log(f"마이문자 연결 확인 완료. 잔여: {balance}건")
+                else:
+                    raise Exception(result.get("message", "인증 실패"))
+            except Exception as e:
+                self.root.after(0, lambda: self.lbl_sms_status.configure(
+                    text="● 마이문자 상태 : 연결 실패", foreground="red"))
+                self.log(f"마이문자 연결 실패: {e}")
         else:
-            self.root.after(0, lambda: self.lbl_sms_status.configure(text="● 마이문자 상태 : 계정 정보 누락", foreground="red"))
+            self.root.after(0, lambda: self.lbl_sms_status.configure(
+                text="● 마이문자 상태 : 계정 정보 누락", foreground="red"))
             self.log("마이문자 아이디/비밀번호가 없습니다.")
 
         self.root.after(0, lambda: self.btn_check.configure(state="normal"))
@@ -230,17 +391,59 @@ class CoupangAutoSMSApp:
             except Exception as e:
                 self.log(f"에러: {str(e)}")
             
-            for _ in range(60):
+            try:
+                interval = max(10, int(self.entry_interval.get()))
+            except ValueError:
+                interval = 60
+            for _ in range(interval):
                 if not self.is_running: break
                 time.sleep(1)
 
+    def _coupang_signature(self, method, path, query=""):
+        secret_key = self.entry_secret_key.get()
+        datetime_now = datetime.now(timezone.utc).strftime('%y%m%dT%H%M%SZ')
+        message = datetime_now + method + path + query
+        signature = hmac.new(
+            secret_key.encode('utf-8'),
+            message.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        return (
+            f"CEA algorithm=HmacSHA256, "
+            f"access-key={self.entry_access_key.get()}, "
+            f"signed-date={datetime_now}, "
+            f"signature={signature}"
+        )
+
     def get_coupang_orders(self):
-        # [실제 API 호출시 requests 사용]
-        return [{
-            'orderId': '1000001', 
-            'ordererName': '테스트고객', 
-            'ordererSafeNumber': '010-0000-0000'
-        }]
+        vendor_id = self.entry_vendor_id.get()
+        path = f"/v2/providers/openapi/apis/api/v4/vendors/{vendor_id}/ordersheets"
+
+        # 최근 1시간 주문 조회
+        now = datetime.now(timezone.utc)
+        created_from = (now - timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M')
+        created_to = now.strftime('%Y-%m-%dT%H:%M')
+
+        params = {
+            "createdAtFrom": created_from,
+            "createdAtTo": created_to,
+            "status": "ACCEPT"
+        }
+        query_string = urlencode(params)
+        authorization = self._coupang_signature("GET", path, query_string)
+
+        url = f"https://api-gateway.coupang.com{path}?{query_string}"
+        headers = {"Authorization": authorization}
+
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            self.log(f"쿠팡 API 오류 (HTTP {response.status_code}): {response.text[:200]}")
+            return []
+
+        data = response.json()
+        orders = data.get("data", [])
+        self.log(f"쿠팡 API 응답: 주문 {len(orders)}건 조회됨.")
+        return orders
 
     def process_order(self, order):
         order_id = str(order.get('orderId', ''))
@@ -254,7 +457,18 @@ class CoupangAutoSMSApp:
             order_id=order_id
         )
 
-        if self.send_sms(customer_phone, msg_content):
+        success = self.send_sms(customer_phone, msg_content)
+        status = "성공" if success else "실패"
+
+        self.send_log.append({
+            "시간": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "주문번호": order_id,
+            "고객명": customer_name,
+            "수신번호": customer_phone,
+            "결과": status
+        })
+
+        if success:
             self.sent_orders.add(order_id)
             self.save_sent_history()
             self.log(f"[발송 성공] {customer_name}님")
@@ -262,8 +476,30 @@ class CoupangAutoSMSApp:
             self.log(f"[발송 실패] {customer_name}님")
 
     def send_sms(self, phone, message):
-        time.sleep(0.5)
-        return True
+        sms_id = self.entry_sms_id.get()
+        sms_pw = self.entry_sms_pw.get()
+        sender = self.entry_sender_phone.get()
+
+        url = "https://www.mymessage.co.kr/api/sendSMS"
+        payload = {
+            "userId": sms_id,
+            "userPw": sms_pw,
+            "sender": sender,
+            "receiver": phone,
+            "msg": message
+        }
+
+        try:
+            response = requests.post(url, data=payload, timeout=10)
+            result = response.json()
+            if result.get("result") == "success":
+                return True
+            else:
+                self.log(f"마이문자 발송 실패: {result.get('message', '알 수 없는 오류')}")
+                return False
+        except Exception as e:
+            self.log(f"마이문자 API 통신 실패: {e}")
+            return False
 
 if __name__ == "__main__":
     root = tk.Tk()

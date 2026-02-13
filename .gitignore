@@ -11,6 +11,7 @@ dist/
 
 # Runtime data
 sent_orders.json
+config.json
 
 # IDE
 .vscode/
